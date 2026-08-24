@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """
-Combined detection pipeline (placeholder version).
+Combined eBPF-to-ML detection pipeline.
 
 This wires together everything built so far into one loop:
-  eBPF tracer -> per-pid syscall sequence buffer -> anomaly check -> quarantine
+  eBPF tracer -> per-pid syscall window -> Random Forest inference -> response
 
-The anomaly check here is a PLACEHOLDER pattern-match (not real ML) so you
-have a working end-to-end demo today. Once your ML teammate's model is
-ready, swap out `is_anomalous()` for a call to their scoring function —
-everything else (buffering, extraction, quarantine trigger) stays the same.
+The classifier is stored at ``ML_model/model/lid_ds_random_forest.joblib``.
+It scores the latest per-PID window of all ten monitored syscalls.
 
 Run with:
     sudo python3 pipeline.py
@@ -21,27 +19,30 @@ import json
 import os
 import uuid
 from collections import defaultdict, deque
+from pathlib import Path
+import sys
 
 from quarantine import quarantine_pid
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT / "ML_model"))
+from model_runtime import LiveSyscallModel
 
 # ---- Config ----
 OUTPUT_DIR = os.path.expanduser("~/syscall_logs")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 TXT_PATH = os.path.join(OUTPUT_DIR, "syscall_trace.txt")
+ALERT_PATH = os.path.join(OUTPUT_DIR, "anomaly_alerts.jsonl")
 
 # One trace_id per run of this script — the ML model needs at least 3
 # events sharing the same (trace_id, pid) to predict from, so this is
 # assigned once at startup, not per-event.
 TRACE_ID = f"run_{uuid.uuid4().hex[:8]}"
 
-SEQ_WINDOW = 10          # how many recent syscalls to keep per pid
-AUTO_QUARANTINE = True   # set False to just print alerts without acting
-
-# Syscalls that are "signal" for the reverse-shell pattern check.
-# Excludes high-frequency noise (openat, clone) that would otherwise
-# push connect/dup2/execve out of a short rolling window before they
-# can be matched together.
-SIGNAL_SYSCALLS = {"connect", "dup2", "execve", "socket", "ptrace", "setuid"}
+MODEL_PATH = Path(os.environ.get("ML_MODEL_PATH", PROJECT_ROOT / "ML_model" / "model" / "lid_ds_random_forest_runtime.json"))
+MODEL_THRESHOLD = float(os.environ.get("MODEL_THRESHOLD", "0.50"))
+# Alert-first is the safe default. Set AUTO_QUARANTINE=1 only after testing.
+AUTO_QUARANTINE = os.environ.get("AUTO_QUARANTINE", "0") == "1"
 
 # ---- eBPF program (same hooks as trace_syscalls.py) ----
 bpf_text = """
@@ -93,36 +94,26 @@ class Event(ct.Structure):
     ]
 
 
-# Per-pid rolling window of recent syscalls: { pid: deque([...]) }
-pid_sequences = defaultdict(lambda: deque(maxlen=SEQ_WINDOW))
+# Per-pid rolling windows are initialized after loading the model so their
+# length always matches the saved training artifact.
+pid_sequences = {}
 # Per-pid process name, so we can log it even after the process is gone
 pid_names = {}
 # Avoid re-quarantining a pid we've already flagged
 already_flagged = set()
+model = None
 
 
-def is_anomalous(pid, sequence):
-    """
-    PLACEHOLDER anomaly check — replace this with your ML teammate's
-    real scoring function once it's ready. For now: flags the classic
-    reverse-shell pattern (connect -> dup2 -> execve appearing in order,
-    anywhere in the recent window).
-    """
-    seq = list(sequence)
-    try:
-        i = seq.index("connect")
-        j = seq.index("dup2", i + 1)
-        seq.index("execve", j + 1)
-        return True, "connect -> dup2 -> execve pattern (reverse-shell signature)"
-    except ValueError:
-        return False, None
+def is_anomalous(sequence):
+    """Return the model verdict, probability, and explanation."""
+    return model.score(sequence)
 
 
-def handle_event(ctx, data, size, txt_file):
+def handle_event(ctx, data, size, txt_file, alert_file):
     event = ct.cast(data, ct.POINTER(Event)).contents
     ts_ns = time.time_ns()
     syscall_name = SYSCALL_NAMES.get(event.syscall_id, "unknown")
-    process_name = event.comm.decode("utf-8", "replace")
+    process_name = event.comm.decode("utf-8", "replace").split("\x00", 1)[0]
 
     record = {
         "trace_id": TRACE_ID,
@@ -131,44 +122,52 @@ def handle_event(ctx, data, size, txt_file):
         "timestamp_ns": ts_ns,
         "syscall": syscall_name,
     }
-    print(record)
-    txt_file.write(json.dumps(record) + "\n")
-    txt_file.flush()
-
     # --- update per-pid sequence buffer ---
-    # Only feed "signal" syscalls into the detection window, so a burst
-    # of unrelated openat/clone calls (e.g. bash loading libraries)
-    # doesn't push connect/dup2/execve out of the window before they
-    # can be matched together.
-    if syscall_name in SIGNAL_SYSCALLS:
-        pid_sequences[event.pid].append(syscall_name)
+    sequence = pid_sequences.setdefault(event.pid, deque(maxlen=model.window_size))
+    sequence.append(record)
     pid_names[event.pid] = process_name
 
     # --- check for anomaly ---
+    flagged, probability, reason = False, 0.0, None
     if event.pid not in already_flagged:
-        flagged, reason = is_anomalous(event.pid, pid_sequences[event.pid])
-        if flagged:
-            already_flagged.add(event.pid)
-            print(f"\n*** ANOMALY DETECTED *** pid={event.pid} "
-                  f"process={process_name} reason=\"{reason}\"")
-            if AUTO_QUARANTINE:
-                quarantine_pid(event.pid)
-            print()
+        flagged, probability, reason = is_anomalous(sequence)
+    record["attack_probability"] = round(probability, 4)
+    print(record)
+    txt_file.write(json.dumps(record) + "\n")
+    txt_file.flush()
+    if flagged:
+        already_flagged.add(event.pid)
+        alert = {**record, "reason": reason, "action": "quarantine" if AUTO_QUARANTINE else "alert_only",
+                 "syscall_window": [item["syscall"] for item in sequence]}
+        alert_file.write(json.dumps(alert) + "\n")
+        alert_file.flush()
+        print(f"\n*** ML ALERT *** pid={event.pid} process={process_name} reason=\"{reason}\"")
+        if AUTO_QUARANTINE:
+            quarantine_pid(event.pid)
+        print()
 
 
 def main():
+    global model
     if os.geteuid() != 0:
         print("Must run as root (sudo python3 pipeline.py).")
         return
 
+    try:
+        model = LiveSyscallModel(MODEL_PATH, threshold=MODEL_THRESHOLD)
+    except (FileNotFoundError, ValueError, OSError, ModuleNotFoundError) as exc:
+        print(f"Cannot load ML model at {MODEL_PATH}: {exc}")
+        return
+    print(f"Loaded Random Forest model: {MODEL_PATH}; window={model.window_size}; threshold={MODEL_THRESHOLD:.2f}")
     b = BPF(text=bpf_text)
     txt_file = open(TXT_PATH, "a")
+    alert_file = open(ALERT_PATH, "a")
 
     b["events"].open_ring_buffer(
-        lambda ctx, data, size: handle_event(ctx, data, size, txt_file)
+        lambda ctx, data, size: handle_event(ctx, data, size, txt_file, alert_file)
     )
 
-    print(f"Pipeline running. Logging to {TXT_PATH}. "
+    print(f"Pipeline running. Events: {TXT_PATH}; alerts: {ALERT_PATH}. "
           f"Auto-quarantine: {AUTO_QUARANTINE}. Ctrl-C to stop.\n")
 
     while True:
@@ -180,6 +179,7 @@ def main():
             break
 
     txt_file.close()
+    alert_file.close()
 
 
 if __name__ == "__main__":

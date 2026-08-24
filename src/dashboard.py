@@ -24,18 +24,22 @@ import os
 import json
 import uuid
 from collections import defaultdict, deque
+from pathlib import Path
+import sys
 
 from quarantine import quarantine_pid
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT / "ML_model"))
+from model_runtime import LiveSyscallModel
+
 TRACE_ID = f"run_{uuid.uuid4().hex[:8]}"
 
-SEQ_WINDOW = 10
-AUTO_QUARANTINE = True
+MODEL_PATH = Path(os.environ.get("ML_MODEL_PATH", PROJECT_ROOT / "ML_model" / "model" / "lid_ds_random_forest_runtime.json"))
+MODEL_THRESHOLD = float(os.environ.get("MODEL_THRESHOLD", "0.50"))
+AUTO_QUARANTINE = os.environ.get("AUTO_QUARANTINE", "0") == "1"
 MAX_ROWS = 20            # most recent/active processes shown at once
 STALE_AFTER_SEC = 15      # rows drop off if no activity for this long
-
-# Same noise filter as pipeline.py — see comment there.
-SIGNAL_SYSCALLS = {"connect", "dup2", "execve", "socket", "ptrace", "setuid"}
 
 OUTPUT_DIR = os.path.expanduser("~/syscall_logs")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -93,36 +97,31 @@ class Event(ct.Structure):
 
 # --- shared state, updated by the eBPF callback, read by the UI loop ---
 class ProcState:
-    __slots__ = ("name", "counts", "last_seen", "sequence", "status")
+    __slots__ = ("name", "counts", "last_seen", "events", "status", "probability")
 
     def __init__(self, name):
         self.name = name
         self.counts = defaultdict(int)   # syscall_name -> count
         self.last_seen = time.time()
-        self.sequence = deque(maxlen=SEQ_WINDOW)
+        self.events = deque()
         self.status = "normal"           # normal | anomaly | quarantined
+        self.probability = 0.0
 
 
 procs = {}          # pid -> ProcState
 already_flagged = set()
+model = None
 
 
-def is_anomalous(sequence):
-    """Same placeholder as pipeline.py — reverse-shell pattern match."""
-    seq = list(sequence)
-    try:
-        i = seq.index("connect")
-        j = seq.index("dup2", i + 1)
-        seq.index("execve", j + 1)
-        return True, "connect->dup2->execve"
-    except ValueError:
-        return False, None
+def is_anomalous(events):
+    """Use the same Random Forest inference as the live pipeline."""
+    return model.score(events)
 
 
 def handle_event(ctx, data, size, txt_file):
     event = ct.cast(data, ct.POINTER(Event)).contents
     syscall_name = SYSCALL_NAMES[event.syscall_id] if event.syscall_id < len(SYSCALL_NAMES) else "unknown"
-    process_name = event.comm.decode("utf-8", "replace")
+    process_name = event.comm.decode("utf-8", "replace").split("\x00", 1)[0]
 
     # log every event to file, same format as pipeline.py / trace_syscalls.py
     record = {
@@ -143,11 +142,13 @@ def handle_event(ctx, data, size, txt_file):
     p.name = process_name
     p.counts[syscall_name] += 1
     p.last_seen = time.time()
-    if syscall_name in SIGNAL_SYSCALLS:
-        p.sequence.append(syscall_name)
+    p.events.append(record)
+    while len(p.events) > model.window_size:
+        p.events.popleft()
 
     if event.pid not in already_flagged:
-        flagged, reason = is_anomalous(p.sequence)
+        flagged, probability, reason = is_anomalous(p.events)
+        p.probability = probability
         if flagged:
             already_flagged.add(event.pid)
             p.status = "anomaly"
@@ -194,7 +195,7 @@ def draw(stdscr, b):
         stdscr.attroff(curses.color_pair(4) | curses.A_BOLD)
 
         # header row
-        header = f"{'PID':>7}  {'PROCESS':<16}  " + "  ".join(f"{n[:6]:>6}" for n in col_names) + f"  {'STATUS':<12}"
+        header = f"{'PID':>7}  {'PROCESS':<16}  " + "  ".join(f"{n[:6]:>6}" for n in col_names) + f"  {'SCORE':>6}  {'STATUS':<12}"
         stdscr.attron(curses.A_BOLD)
         stdscr.addnstr(2, 0, header[:w], w)
         stdscr.attroff(curses.A_BOLD)
@@ -210,7 +211,7 @@ def draw(stdscr, b):
             if row_y >= h - 1:
                 break
             counts_str = "  ".join(f"{s.counts.get(n, 0):>6}" for n in col_names)
-            line = f"{pid:>7}  {s.name[:16]:<16}  {counts_str}  {s.status:<12}"
+            line = f"{pid:>7}  {s.name[:16]:<16}  {counts_str}  {s.probability:>6.2f}  {s.status:<12}"
 
             if s.status == "quarantined":
                 color = curses.color_pair(3) | curses.A_BOLD
@@ -230,10 +231,16 @@ def draw(stdscr, b):
 
 
 def main():
+    global model
     if os.geteuid() != 0:
         print("Must run as root (sudo python3 dashboard.py).")
         return
 
+    try:
+        model = LiveSyscallModel(MODEL_PATH, threshold=MODEL_THRESHOLD)
+    except (FileNotFoundError, ValueError, OSError, ModuleNotFoundError) as exc:
+        print(f"Cannot load ML model at {MODEL_PATH}: {exc}")
+        return
     b = BPF(text=bpf_text)
     txt_file = open(TXT_PATH, "a")
     b["events"].open_ring_buffer(lambda ctx, data, size: handle_event(ctx, data, size, txt_file))

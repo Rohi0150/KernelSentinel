@@ -66,7 +66,13 @@ KernelSentinel/
 ├── src/
 │   ├── dashboard.py
 │   ├── pipeline.py
+│   ├── quarantine.py
 │   └── trace_syscalls.py
+│
+├── ML_model/
+│   ├── model/lid_ds_random_forest_runtime.json
+│   ├── model_runtime.py
+│   └── train_model.py
 │
 ├── test/
 │   └── test_case.sh
@@ -213,39 +219,132 @@ cd KernelSentinel
 Create a Python virtual environment:
 
 ```bash
-python3 -m venv .venv
+python3 -m venv --system-site-packages .venv
 source .venv/bin/activate
 ```
 
-Install the required Python packages:
+Install the training dependencies only if you need to retrain the model:
 
 ```bash
 pip install -r requirements.txt
+```
+
+The live pipeline uses the dependency-free exported JSON model; it needs BCC
+but does not need scikit-learn. BCC is supplied by the Linux package manager,
+not pip. On Ubuntu/Debian:
+
+```bash
+sudo apt install bpfcc-tools python3-bpfcc linux-headers-$(uname -r)
 ```
 
 ---
 
 ## ▶️ Usage
 
-### 1. Start system-call tracing
+## 🚀 Run the ML Pipeline
+
+Run all commands from the project root:
 
 ```bash
-python3 src/trace_syscalls.py
+cd /path/to/KernelSentinel
 ```
 
-### 2. Run the processing pipeline
+### Prerequisites
+
+The live eBPF collector needs Linux BCC support:
 
 ```bash
-python3 src/pipeline.py
+sudo apt install bpfcc-tools python3-bpfcc linux-headers-$(uname -r)
 ```
 
-### 3. Start the dashboard
+The committed deployment model is:
+
+```text
+ML_model/model/lid_ds_random_forest_runtime.json
+```
+
+This is the model loaded by the live pipeline. It is an exported version of
+the trained Random Forest and runs with the system Python/BCC installation
+without importing scikit-learn. The original `.joblib` file is retained only
+for retraining and offline experimentation.
+
+### Verify model loading first
+
+This requires neither root access nor eBPF:
 
 ```bash
-python3 src/dashboard.py
+python3 test/test_model_runtime.py
+```
+
+Expected result:
+
+```text
+benign: flagged=False
+attack: flagged=True
+```
+
+### 1. Run the ML-enabled pipeline
+
+```bash
+sudo env AUTO_QUARANTINE=0 "$PWD/.venv/bin/python" src/pipeline.py
+```
+
+If no project virtual environment exists, use the system Python directly:
+
+```bash
+sudo env AUTO_QUARANTINE=0 python3 src/pipeline.py
+```
+
+The pipeline loads `ML_model/model/lid_ds_random_forest_runtime.json`, keeps a
+10-event window for every PID, and writes scored events and alerts to:
+
+```bash
+~/syscall_logs/syscall_trace.txt
+~/syscall_logs/anomaly_alerts.jsonl
+```
+
+`AUTO_QUARANTINE=0` is the safe default: alerts do not modify processes. Only
+after validating on a controlled system should you use `AUTO_QUARANTINE=1`.
+
+The default attack-probability threshold is `0.50`. To reduce alerts, raise
+the threshold; for example:
+
+```bash
+sudo env AUTO_QUARANTINE=0 MODEL_THRESHOLD=0.70 python3 src/pipeline.py
+```
+
+Each event record includes `attack_probability`. Each record in
+`anomaly_alerts.jsonl` also includes the alert reason, response action, and
+the syscall window that produced the classification.
+
+### 2. Start the ML-enabled dashboard
+
+```bash
+sudo env AUTO_QUARANTINE=0 "$PWD/.venv/bin/python" src/dashboard.py
 ```
 
 > The exact execution parameters may change as the prototype evolves.
+
+### 3. Verify the model without eBPF/root
+
+```bash
+.venv/bin/python test/test_model_runtime.py
+```
+
+### Retrain the model (optional)
+
+The prepared LID-DS training split is in `ML_model/datasets/`. Retraining
+requires scikit-learn, then the new `.joblib` must be exported again for the
+live eBPF pipeline:
+
+```bash
+cd ML_model
+../.venv/bin/python train_model.py
+../.venv/bin/python export_runtime_model.py
+```
+
+The pipeline automatically loads the regenerated runtime JSON model on its
+next start.
 
 ---
 
@@ -331,4 +430,3 @@ Detection results produced by the current prototype may be inaccurate and should
 ## 📄 License
 
 License information will be added as the project matures.
-

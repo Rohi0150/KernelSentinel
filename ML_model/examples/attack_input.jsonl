@@ -1,0 +1,10 @@
+{"trace_id":"Bruteforce_CWE-307/black_black_4167","pid":16090,"process_name":"apache2","timestamp_ns":3538955671051,"syscall":"openat"}
+{"trace_id":"Bruteforce_CWE-307/black_black_4167","pid":16090,"process_name":"apache2","timestamp_ns":3538960943644,"syscall":"openat"}
+{"trace_id":"Bruteforce_CWE-307/black_black_4167","pid":16090,"process_name":"apache2","timestamp_ns":3539216037005,"syscall":"openat"}
+{"trace_id":"Bruteforce_CWE-307/black_black_4167","pid":16090,"process_name":"apache2","timestamp_ns":3539305089153,"syscall":"openat"}
+{"trace_id":"Bruteforce_CWE-307/black_black_4167","pid":16090,"process_name":"apache2","timestamp_ns":3542889760529,"syscall":"openat"}
+{"trace_id":"Bruteforce_CWE-307/black_black_4167","pid":16090,"process_name":"apache2","timestamp_ns":3542954193308,"syscall":"openat"}
+{"trace_id":"Bruteforce_CWE-307/black_black_4167","pid":16090,"process_name":"apache2","timestamp_ns":3543003375003,"syscall":"openat"}
+{"trace_id":"Bruteforce_CWE-307/black_black_4167","pid":16090,"process_name":"apache2","timestamp_ns":3559706595279,"syscall":"openat"}
+{"trace_id":"Bruteforce_CWE-307/black_black_4167","pid":16090,"process_name":"apache2","timestamp_ns":3559708396877,"syscall":"openat"}
+{"trace_id":"Bruteforce_CWE-307/black_black_4167","pid":16090,"process_name":"apache2","timestamp_ns":3559766043948,"syscall":"openat"}
