@@ -66,7 +66,13 @@ KernelSentinel/
 ├── src/
 │   ├── dashboard.py
 │   ├── pipeline.py
+│   ├── quarantine.py
 │   └── trace_syscalls.py
+│
+├── ML_model/
+│   ├── model/lid_ds_random_forest_runtime.json
+│   ├── model_runtime.py
+│   └── train_model.py
 │
 ├── test/
 │   └── test_case.sh
@@ -213,39 +219,58 @@ cd KernelSentinel
 Create a Python virtual environment:
 
 ```bash
-python3 -m venv .venv
+python3 -m venv --system-site-packages .venv
 source .venv/bin/activate
 ```
 
-Install the required Python packages:
+Install the training dependencies only if you need to retrain the model:
 
 ```bash
 pip install -r requirements.txt
+```
+
+The live pipeline uses the dependency-free exported JSON model; it needs BCC
+but does not need scikit-learn. BCC is supplied by the Linux package manager,
+not pip. On Ubuntu/Debian:
+
+```bash
+sudo apt install bpfcc-tools python3-bpfcc linux-headers-$(uname -r)
 ```
 
 ---
 
 ## ▶️ Usage
 
-### 1. Start system-call tracing
+### 1. Run the ML-enabled pipeline
 
 ```bash
-python3 src/trace_syscalls.py
+sudo env AUTO_QUARANTINE=0 "$PWD/.venv/bin/python" src/pipeline.py
 ```
 
-### 2. Run the processing pipeline
+The pipeline loads `ML_model/model/lid_ds_random_forest_runtime.json`, keeps a
+10-event window for every PID, and writes scored events and alerts to:
 
 ```bash
-python3 src/pipeline.py
+~/syscall_logs/syscall_trace.txt
+~/syscall_logs/anomaly_alerts.jsonl
 ```
 
-### 3. Start the dashboard
+`AUTO_QUARANTINE=0` is the safe default: alerts do not modify processes. Only
+after validating on a controlled system should you use `AUTO_QUARANTINE=1`.
+
+### 2. Start the ML-enabled dashboard
 
 ```bash
-python3 src/dashboard.py
+sudo env AUTO_QUARANTINE=0 "$PWD/.venv/bin/python" src/dashboard.py
 ```
 
 > The exact execution parameters may change as the prototype evolves.
+
+### 3. Verify the model without eBPF/root
+
+```bash
+.venv/bin/python test/test_model_runtime.py
+```
 
 ---
 
@@ -331,4 +356,3 @@ Detection results produced by the current prototype may be inaccurate and should
 ## 📄 License
 
 License information will be added as the project matures.
-

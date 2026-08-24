@@ -1,0 +1,4 @@
+{"trace_id":"benign_demo_001","pid":27737,"process_name":"apache2","timestamp_ns":76008080868,"syscall":"socket"}
+{"trace_id":"benign_demo_001","pid":27737,"process_name":"apache2","timestamp_ns":76008105424,"syscall":"connect"}
+{"trace_id":"benign_demo_001","pid":27737,"process_name":"apache2","timestamp_ns":77011448314,"syscall":"socket"}
+{"trace_id":"benign_demo_001","pid":27737,"process_name":"apache2","timestamp_ns":77011466999,"syscall":"connect"}
